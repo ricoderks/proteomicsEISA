@@ -1,0 +1,876 @@
+---
+title: "R Notebook"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r libraries, results='hide'}
+library(here)
+library(tidyverse)
+library(eisaCIM)
+```
+
+```{r general_stuff}
+work_dir <- here()
+data_dir <- here(work_dir, "Data", "mzML", "sir")
+```
+
+# Read all files
+
+Get the list of mzML files.
+
+```{r}
+mzml_files <- list.files(path = data_dir,
+                         pattern = ".*conv.*\\.mzML",
+                         full.names = TRUE)
+```
+
+Read the raw files.
+
+```{r}
+all_raw_data <- read_files(files = mzml_files)
+```
+
+Extract all the data.
+
+```{r}
+all_data <- list()
+
+for(a in 1:length(mzml_files)) {
+  all_data[[a]] <- extract_sim_data(data = all_raw_data[, a],
+                                    sim_names = c("120", "136"),
+                                    sim_ids = c(1, 2))
+}
+```
+
+```{r}
+# create names for the data frames
+df_names <- str_extract(string = mzml_files,
+                        pattern = "[0-9]{1,3}[un]M_[1-3]")
+
+names(all_data) <- df_names
+```
+
+```{r}
+all_data_df <- do.call(rbind, all_data) %>% 
+  rownames_to_column() %>% 
+  rename(file = rowname) %>% 
+  mutate(replicate = str_replace(string = file,
+                                 pattern = "([0-9]{1,3}[un]M)_([1-3])\\.[0-9]*",
+                                 replacement = "\\2"),
+         replicate = factor(replicate, 
+                            levels = c(1, 2, 3)),
+         conc = str_extract(string = file,
+                            pattern = "[0-9]{1,3}[un]M"),
+         conc = factor(conc, 
+                       levels = c("1nM", "2nM", "5nM", "10nM", "25nM", "50nM", "100nM", "250nM", "500nM", "1uM", "5uM", "10uM", "25uM", "50uM", "75uM", "100uM")),
+         rep_conc = paste0(replicate, "_", conc)) %>% 
+  arrange(conc)
+```
+
+Quick overview of some concentrations.
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+all_data_df %>% 
+  filter(conc == "1nM" |
+           conc == "5nM" |
+           conc == "10nM" |
+           conc == "25nM") %>% 
+  ggplot() +
+  geom_line(aes(x = rt,
+                y = intensity,
+                color = conc,
+                group = rep_conc)) +
+  scale_y_continuous(labels = scales::scientific) +
+  facet_grid(rows = vars(conc),
+             cols = vars(sim),
+             scales = "free") +
+  # lims(x = c(3.5, 4)) +
+  theme_minimal()
+```
+
+Zoom in on leu-enk peak.
+
+```{r fig.width=10, warning=FALSE, message=FALSE}
+all_data_df %>% 
+  filter(conc == "1nM" |
+           conc == "5nM" |
+           conc == "10nM" |
+           conc == "25nM") %>% 
+  ggplot() +
+  geom_line(aes(x = rt,
+                y = intensity,
+                color = conc,
+                group = rep_conc)) +
+  scale_y_continuous(labels = scales::scientific) +
+  facet_grid(rows = vars(conc),
+             cols = vars(sim),
+             scales = "free") +
+  lims(x = c(3.5, 4)) +
+  theme_minimal()
+```
+
+# SIM
+
+## 25nM
+
+```{r}
+raw_data <- read_files(files = mzml_files[23])
+```
+
+Show the SIM's present.
+
+```{r}
+get_all_sim(data = raw_data)
+```
+
+There are 2 SIM's present for leu-enk.
+
+```{r}
+# define the name of the SIM traces
+sim_names <- c("120", "136")
+# the index of the SIM traces
+sim_ids <- c(1, 2)
+
+sim_data <- extract_sim_data(data = raw_data,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+```
+
+```{r}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk fragments [25 nM]") + 
+  lims(x = c(0, 9))
+```
+
+```{r}
+# define the noise level for each trace
+noise <- c(2e6, 8e5)
+
+# do the actual peak picking
+my_peaks <- find_peaks(data = raw_data,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise,
+                       peakwidth = c(0.05, 0.1))
+```
+
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk fragments [25 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the two traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 5)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 2)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk fragments [25 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram
+
+```{r}
+plot_cim(sim_data = sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk fragments [25 nM]",
+         select_sim = "120",
+         rt_line = 3.7)
+```
+
+## 10nM
+
+```{r}
+raw_data <- read_files(files = mzml_files[8])
+```
+
+Show the SIM's present.
+
+```{r}
+get_all_sim(data = raw_data)
+```
+
+There are 2 SIM's present for leu-enk.
+
+```{r}
+# define the name of the SIM traces
+sim_names <- c("120", "136")
+# the index of the SIM traces
+sim_ids <- c(1, 2)
+
+sim_data <- extract_sim_data(data = raw_data,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+```
+
+```{r}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk fragments [10 nM]") + 
+  lims(x = c(0, 9))
+```
+
+```{r}
+# define the noise level for each trace
+noise <- c(1e6, 4e5)
+
+# do the actual peak picking
+my_peaks <- find_peaks(data = raw_data,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise,
+                       peakwidth = c(0.05, 0.1))
+```
+
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk fragments [10 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the two traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 5)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 2)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk fragments [10 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram
+
+```{r}
+plot_cim(sim_data = sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk fragments [10 nM]",
+         select_sim = "120",
+         rt_line = 3.75)
+```
+
+## 5nM
+
+```{r}
+raw_data <- read_files(files = mzml_files[41])
+```
+
+Show the SIM's present.
+
+```{r}
+get_all_sim(data = raw_data)
+```
+
+There are 2 SIM's present for leu-enk.
+
+```{r}
+# define the name of the SIM traces
+sim_names <- c("120", "136")
+# the index of the SIM traces
+sim_ids <- c(1, 2)
+
+sim_data <- extract_sim_data(data = raw_data,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+```
+
+```{r}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk fragments [5 nM]") + 
+  lims(x = c(0, 9))
+```
+
+```{r}
+# define the noise level for each trace
+noise <- c(5e5, 2e5)
+
+# do the actual peak picking
+my_peaks <- find_peaks(data = raw_data,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise,
+                       peakwidth = c(0.05, 0.1))
+```
+
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk fragments [5 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the two traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 5)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 2)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk fragments [5 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk fragments [5 nM]",
+         select_sim = "120",
+         rt_line = 3.7)
+```
+
+# MRM and SIM
+
+Combine MRM and SIM
+
+```{r}
+all_mzml_files <- list.files(path = here(work_dir, "Data", "mzML"),
+                             pattern = ".*\\.mzML",
+                             recursive = TRUE,
+                             full.names = TRUE)
+```
+
+## 25 nM
+
+```{r}
+mrm_raw <- read_files(files = all_mzml_files[23])
+sim_raw <- read_files(files = all_mzml_files[119])
+```
+
+Show the MRM's and SIM's present.
+
+```{r}
+get_all_sim(data = mrm_raw)
+get_all_sim(data = sim_raw)
+```
+
+Extract the data for the MRM and SIM.
+
+```{r}
+# MRM
+mrm_names <- c("556")
+mrm_ids <- 2
+mrm_data <- extract_sim_data(data = mrm_raw,
+                             sim_names = mrm_names,
+                             sim_ids = mrm_ids)
+
+
+sim_names <- c("120", "136")
+sim_ids <- c(1, 2)
+sim_data <- extract_sim_data(data = sim_raw,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+
+mrm_sim_data <- rbind(mrm_data, sim_data)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.72,
+          title = "Leu-enk [25 nM]") +
+  lims(x = c(0, 10))
+  # lims(x = c(3, 4.5))
+```
+
+```{r}
+# define the noise level for each trace
+noise_mrm <- c(1e6)
+
+# do the actual peak picking
+my_peaks_mrm <- find_peaks(data = mrm_raw,
+                       sim_ids = mrm_ids,
+                       sim_names = mrm_names,
+                       noise = noise_mrm,
+                       peakwidth = c(0.05, 0.1))
+
+# define the noise level for each trace
+noise_sim <- c(2e6, 5e5)
+
+# do the actual peak picking
+my_peaks_sim <- find_peaks(data = sim_raw,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise_sim,
+                       peakwidth = c(0.05, 0.1))
+
+my_peaks <- rbind(my_peaks_mrm, my_peaks_sim)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.72,
+          title = "Leu-enk [25 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the three traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 5)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 3)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.72,
+          title = "Leu-enk [25 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram. Created from trace 120. 
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [25 nM]",
+         select_sim = "120",
+         rt_line = 3.7)
+```
+
+Plot the CIM chromatogram. Created from trace 556.
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [25 nM]",
+         select_sim = "556",
+         rt_line = 3.72)
+```
+
+## 10 nM
+
+```{r}
+mrm_raw <- read_files(files = all_mzml_files[7])
+sim_raw <- read_files(files = all_mzml_files[104])
+```
+
+Show the MRM's and SIM's present.
+
+```{r}
+get_all_sim(data = mrm_raw)
+get_all_sim(data = sim_raw)
+```
+
+Extract the data for the MRM and SIM.
+
+```{r}
+# MRM
+mrm_names <- c("556")
+mrm_ids <- 2
+mrm_data <- extract_sim_data(data = mrm_raw,
+                             sim_names = mrm_names,
+                             sim_ids = mrm_ids)
+
+
+sim_names <- c("120", "136")
+sim_ids <- c(1, 2)
+sim_data <- extract_sim_data(data = sim_raw,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+
+mrm_sim_data <- rbind(mrm_data, sim_data)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.72,
+          title = "Leu-enk [10 nM]") +
+  lims(x = c(0, 10))
+  # lims(x = c(3, 4.5))
+```
+
+```{r}
+# define the noise level for each trace
+noise_mrm <- c(7.5e5)
+
+# do the actual peak picking
+my_peaks_mrm <- find_peaks(data = mrm_raw,
+                       sim_ids = mrm_ids,
+                       sim_names = mrm_names,
+                       noise = noise_mrm,
+                       peakwidth = c(0.05, 0.1))
+
+# define the noise level for each trace
+noise_sim <- c(1e6, 4e5)
+
+# do the actual peak picking
+my_peaks_sim <- find_peaks(data = sim_raw,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise_sim,
+                       peakwidth = c(0.05, 0.1))
+
+my_peaks <- rbind(my_peaks_mrm, my_peaks_sim)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.72,
+          title = "Leu-enk [10 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the three traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 5)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 3)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk [10 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram. Created from trace 120. 
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [10 nM]",
+         select_sim = "120",
+         rt_line = 3.7)
+```
+
+Plot the CIM chromatogram. Created from trace 556.
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [10 nM]",
+         select_sim = "556",
+         rt_line = 3.72)
+```
+
+## 2 nM
+
+```{r}
+mrm_raw <- read_files(files = all_mzml_files[29])
+sim_raw <- read_files(files = all_mzml_files[125])
+```
+
+Show the MRM's and SIM's present.
+
+```{r}
+get_all_sim(data = mrm_raw)
+get_all_sim(data = sim_raw)
+```
+
+Extract the data for the MRM and SIM.
+
+```{r}
+# MRM
+mrm_names <- c("556")
+mrm_ids <- 2
+mrm_data <- extract_sim_data(data = mrm_raw,
+                             sim_names = mrm_names,
+                             sim_ids = mrm_ids)
+
+
+sim_names <- c("120", "136")
+sim_ids <- c(1, 2)
+sim_data <- extract_sim_data(data = sim_raw,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+
+mrm_sim_data <- rbind(mrm_data, sim_data)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.72,
+          title = "Leu-enk [2 nM]") +
+  lims(x = c(0, 10))
+  # lims(x = c(3, 4.5))
+```
+
+```{r}
+# define the noise level for each trace
+noise_mrm <- c(0.5e5)
+
+# do the actual peak picking
+my_peaks_mrm <- find_peaks(data = mrm_raw,
+                       sim_ids = mrm_ids,
+                       sim_names = mrm_names,
+                       noise = noise_mrm,
+                       peakwidth = c(0.05, 0.1))
+
+# define the noise level for each trace
+noise_sim <- c(4e5, 1e5)
+
+# do the actual peak picking
+my_peaks_sim <- find_peaks(data = sim_raw,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise_sim,
+                       peakwidth = c(0.05, 0.1))
+
+my_peaks <- rbind(my_peaks_mrm, my_peaks_sim)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk [2 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the three traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 5)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 3)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.7,
+          title = "Leu-enk [2 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram. Created from trace 120. 
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [2 nM]",
+         select_sim = "120",
+         rt_line = 3.7) 
+```
+
+Plot the CIM chromatogram. Created from trace 556 
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [2 nM]",
+         select_sim = "556",
+         rt_line = 3.72) 
+```
+
+## 1 nM
+
+```{r}
+mrm_raw <- read_files(files = all_mzml_files[14])
+sim_raw <- read_files(files = all_mzml_files[110])
+```
+
+Show the MRM's and SIM's present.
+
+```{r}
+get_all_sim(data = mrm_raw)
+get_all_sim(data = sim_raw)
+```
+
+Extract the data for the MRM and SIM.
+
+```{r}
+# MRM
+mrm_names <- c("556")
+mrm_ids <- 2
+mrm_data <- extract_sim_data(data = mrm_raw,
+                             sim_names = mrm_names,
+                             sim_ids = mrm_ids)
+
+
+sim_names <- c("120", "136")
+sim_ids <- c(1, 2)
+sim_data <- extract_sim_data(data = sim_raw,
+                             sim_names = sim_names,
+                             sim_ids = sim_ids)
+
+mrm_sim_data <- rbind(mrm_data, sim_data)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk [1 nM]") +
+  lims(x = c(0, 10))
+  # lims(x = c(3, 4.5))
+```
+
+```{r}
+# define the noise level for each trace
+noise_mrm <- c(0.5e5)
+
+# do the actual peak picking
+my_peaks_mrm <- find_peaks(data = mrm_raw,
+                       sim_ids = mrm_ids,
+                       sim_names = mrm_names,
+                       noise = noise_mrm,
+                       peakwidth = c(0.05, 0.1))
+
+# define the noise level for each trace
+noise_sim <- c(3.5e5, 1.2e5)
+
+# do the actual peak picking
+my_peaks_sim <- find_peaks(data = sim_raw,
+                       sim_ids = sim_ids,
+                       sim_names = sim_names,
+                       noise = noise_sim,
+                       peakwidth = c(0.03, 0.1))
+
+my_peaks <- rbind(my_peaks_mrm, my_peaks_sim)
+```
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk [1 nM]",
+          peak_data = my_peaks) + 
+  lims(x = c(0, 9))
+```
+
+Group the peaks over the three traces. Group the peaks of the different traces if they are elute with a difference of smaller then 5 seconds.
+
+```{r}
+my_peaks <- group_peaks(peak_list = my_peaks,
+                        rt_diff = 3)
+```
+
+
+Clean up the peak list, only keep a peak group if it has a peak in each trace.
+
+```{r}
+my_peaks_clean <- my_peaks %>% 
+  filter(num_peaks == 3)
+```
+
+Show the SIM’s in combination with the cleaned peak list.
+
+```{r warning=FALSE, message=FALSE}
+plot_sims(sim_data = mrm_sim_data,
+          rt_line = 3.75,
+          title = "Leu-enk [1 nM]",
+          peak_data = my_peaks_clean) +
+  lims(x = c(0, 9))
+```
+
+Plot the CIM chromatogram. Created from trace 120. 
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [1 nM]",
+         select_sim = "120",
+         rt_line = 3.75) 
+```
+
+Plot the CIM chromatogram. Created from trace 556 
+
+```{r warning=FALSE, message=FALSE}
+plot_cim(sim_data = mrm_sim_data,
+         peak_list = my_peaks_clean,
+          title = "Leu-enk [1 nM]",
+         select_sim = "556",
+         rt_line = 3.8) 
+```
+
+
+# Session info
+
+```{r}
+sessioninfo::session_info()
+```
+

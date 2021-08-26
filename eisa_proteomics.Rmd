@@ -1,0 +1,632 @@
+---
+title: "EISA proteomics"
+output:
+  html_notebook:
+    code_folding: hide
+---
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+library(here)
+library(tidyverse)
+library(xcms)
+library(readxl)
+library(ggrepel)
+library(ggforce)
+library(foreach)
+library(doParallel)
+library(OrgMassSpecR)
+library(ggrepel)
+
+source("./PepIsotopeDistribution.R")
+```
+
+```{r geneneral_stuff}
+work_dir <- here()
+data_dir <- here(work_dir, "Data")
+
+data_file <- "BSA_eISA_redo_50_60eV_p1a4_01_8086.mzML"
+db_file <- "peptide_db.Rdata"
+
+# +/- seconds
+rt_window <- 10
+# +/- Da
+mz_window <- 0.01
+# set the correlatoin coefficient limit
+cor_limit <- 0.8
+```
+
+# Read the MS file
+
+The mzML file contains MS levels. MS level 1 is MS1 and MS level 2 is the isCID experiment.
+
+```{r}
+raw_data <- readMSData(files = here(data_dir, data_file),
+                       msLevel. = 2,
+                       mode = "onDisk")
+```
+
+Show the BPC of the isCID experiment.
+
+```{r}
+bpis <- chromatogram(object = raw_data, 
+                     aggregationFun = "max",
+                     msLevel = 2L)
+
+plot(bpis)
+```
+
+# Read the database
+
+```{r}
+load(file = here(data_dir, db_file))
+```
+
+Calculate isotopes. ***Not sure it this is still needed***
+
+```{r}
+db_data <- db_data %>% 
+  mutate(M1 = mz + 1.003 / charge,
+         M2 = mz + (2 * 1.003) / charge,
+         M3 = mz + (3 * 1.003) / charge)
+```
+
+Show the first few lines of the database.
+
+```{r}
+db_data %>% 
+  head(n = 10)
+```
+
+Calculate isotopes.
+
+```{r}
+db_data <- db_data %>% 
+  mutate(M1 = mz + 1.003 / charge,
+         M2 = mz + (2 * 1.003) / charge,
+         M3 = mz + (3 * 1.003) / charge,
+         M4 = mz + (4 * 1.003) / charge)
+```
+
+# Analysis
+
+For each peptide create extracted ion chromatograms for all precursor ions en fragment ions.
+
+# One peptide
+
+Start with one peptide (SLHTLFGDELCK).
+
+```{r}
+selected_pep_id <- 1
+
+peptide <- db_data %>% 
+  filter(pep_id == selected_pep_id) %>% 
+  mutate(mz_char = sprintf("%.4f", mz))
+
+mzs <- matrix(c(peptide$mz - mz_window, peptide$mz + mz_window), ncol = 2)
+rts <- unique(peptide$RT) * 60 + c(-rt_window, rt_window)
+
+eics <- chromatogram(object = raw_data,
+                     mz = mzs,
+                     rt = rts,
+                     msLevel = 2L,
+                     aggregationFun = "max")
+```
+
+Remove all EIC's which have more than 80% NA's.
+
+Show all EIC's. 
+
+```{r}
+# put everything in a single data frame
+eic_df_wide <- cbind(tibble(rt = rtime(eics[[1]])), mapply(intensity, eics))
+# set the column names
+colnames(eic_df_wide) <- c("rt", sprintf("%.4f", peptide$mz))
+
+# calculate the ratio of NA's
+num_na <- sapply(eic_df_wide[, -1], function(x) mean(is.na(x)))
+num_na_names <- names(which(num_na > 0.8))
+
+# make long format
+eic_df <- eic_df_wide %>% 
+  # remove columns (EIC's) which contain too many NA's
+  select(-any_of(num_na_names)) %>% 
+  pivot_longer(cols = -rt,
+               names_to = "eic",
+               values_to = "intens") %>% 
+  group_by(eic) %>% 
+  mutate(show_eic = ifelse(intens == max(intens, na.rm = TRUE),
+                           eic,
+                           NA_character_))
+```
+
+```{r fig.width=10, warning=FALSE}
+eic_df %>% 
+  ggplot(aes(x = rt,
+             y = intens)) +
+  geom_line(aes(color = eic,
+                group = eic)) +
+  # geom_text_repel(aes(label = show_eic)) +
+  guides(color = "none") +
+  labs(x = "Retention time [s]",
+       y = "Intensity",
+       title = paste0("Peptide: ", db_data$sequence[db_data$pep_id == 5][selected_pep_id])) +
+  facet_zoom(y = intens < 1e4,
+             zoom.size = 1) +
+  theme_minimal()
+```
+
+```{r fig.height=20, fig.width=10, warning=FALSE}
+eic_labels <- paste0(peptide$fragment, "(", peptide$charge, "+) - ", peptide$mz_char)
+names(eic_labels) <- peptide$mz_char
+
+eic_df %>% 
+  left_join(y = peptide,
+            by = c("eic" = "mz_char")) %>% 
+  ggplot(aes(x = rt,
+             y = intens)) +
+  geom_line(aes(color = eic,
+                group = eic)) +
+  geom_vline(xintercept = peptide$RT[selected_pep_id] * 60,
+             linetype = 2) +
+  guides(color = "none") +
+  scale_y_continuous(labels = scales::scientific) +
+  labs(x = "Retention time [s]",
+       y = "Intensity",
+       title = paste0("Peptide: ", db_data$sequence[db_data$pep_id == 5][selected_pep_id])) +
+  facet_wrap(vars(eic),
+             scales = "free_y",
+             ncol = 3,
+             labeller = labeller(eic = eic_labels)) +
+  theme_minimal()
+```
+
+Determine which of the precursor signals (1+, 2+ or 3+) is the highest.
+
+```{r}
+# get the highest value for each precursor singal
+high_precursor <- sapply(eic_df_wide[, 2:4], max, na.rm = TRUE)
+highest_precursor <- names(which(high_precursor == max(high_precursor)))
+
+highest_precursor
+```
+
+Get the correlation of all EIC's to this precursor EIC.
+
+```{r}
+# remove the columns which contain too many NA's
+eic_cor_df <- eic_df_wide[, -1] %>% 
+  select(-any_of(num_na_names))
+# replace NA's by zero
+eic_cor_df[is.na(eic_cor_df)] <- 0
+
+# calculate the correlation between the EIC's
+eic_cor_result <- cor(eic_cor_df)[, highest_precursor]
+```
+
+Show all correlation coeffiencts. 710.3505 is the precursor ion with the highest signal.
+
+```{r}
+# transform to dataframe, first 3 rows are the precursor signals
+cor_result_df <- as_tibble(eic_cor_result,
+                           rownames = "fragment_mz") 
+
+cor_result_df %>% 
+  arrange(desc(value))
+```
+
+The fragment percentage found.
+
+```{r}
+peptide_res <- peptide %>% 
+  left_join(y = cor_result_df,
+            by = c("mz_char" = "fragment_mz")) %>% 
+  mutate(found = ifelse(value >= cor_limit,
+                        TRUE,
+                        FALSE),
+         found = ifelse(is.na(found),
+                        FALSE,
+                        found))
+
+peptide_res %>% 
+  filter(fragment != "precursor") %>% 
+  group_by(series, charge) %>% 
+  summarise(frag_found = mean(found),
+            .groups = "drop")
+```
+
+## Isotopic distribution
+
+Get all raw MS spectra.
+
+```{r eval=FALSE}
+raw_df <- as(raw_data, "data.frame")
+```
+
+Extract spectrum at the peak top.
+
+```{r eval=FALSE}
+pep_res_filtered <- peptide_res %>% 
+  mutate(spec = pmap(.l = list(RT, mz, charge),
+                     .f = ~ raw_df %>% 
+                       filter(rt > ..1 * 60 - 0.25 &
+                                rt < ..1 * 60 + 0.25,
+                              mz > ..2 - 0.2 &
+                                mz < ..2 + 4 / ..3) %>% 
+                       mutate(i_perc = i / max(i) * 100) %>% 
+                       select(mz, i_perc)))
+```
+
+Calculate the spectrum similarity.
+
+```{r eval=FALSE}
+pep_res_filtered <- pep_res_filtered %>% 
+  mutate(similarity = map2_dbl(.x = spec,
+                               .y = theor_isotopes,
+                               .f = ~ SpectrumSimilarity(spec.top = .x,
+                                                         spec.bottom = .y,
+                                                         t = 0.01,
+                                                         print.graphic = FALSE)))
+```
+
+Alternative method. Get the maximimum of each of the EIC's of the isotopes and create a spectrum. For now only M+0, M+1, M+2 and M+3 are used.
+
+```{r results='hide'}
+# get the EIC's of mz, M1, M2 and M3
+get_measured_isotopes <- function(M0, M1, M2, M3, RT) {
+  mzs <- matrix(c(M0 - mz_window, M0 + mz_window,
+                  M1 - mz_window, M1 + mz_window + mz_window,
+                  M2 - mz_window, M2 + mz_window + mz_window,
+                  M3 - mz_window, M3 + mz_window + mz_window),
+                ncol = 2, byrow = TRUE)
+  rts <- unique(peptide$RT) * 60 + c(-rt_window, rt_window)
+  
+  eics <- chromatogram(object = raw_data,
+                       mz = mzs,
+                       rt = rts,
+                       msLevel = 2L,
+                       aggregationFun = "max")
+  
+  max_intens <- apply(mapply(intensity, eics), 2, function(x) max(x, na.rm = TRUE))
+  
+  res <- data.frame(mz = c(M0, M1, M2, M3),
+                    i = max_intens) %>% 
+    mutate(i = ifelse(is.infinite(i),
+                      0, 
+                      i),
+           i_perc = i / max(i) * 100,
+           i_perc = ifelse(is.nan(i_perc),
+                           0,
+                           i_perc)) %>% 
+    select(-i)
+  
+  return(res)
+}
+
+peptide_res <- peptide_res %>% 
+  mutate(meas_isotopes = pmap(.l = list(mz, M1, M2, M3, RT),
+                              .f = ~ get_measured_isotopes(M0 = ..1,
+                                                           M1 = ..2,
+                                                           M2 = ..3,
+                                                           M3 = ..4,
+                                                           RT = ..5)))
+
+```
+
+Calculate similarity.
+
+```{r}
+peptide_res <- peptide_res %>% 
+  mutate(similarity = map2_dbl(.x = meas_isotopes,
+                               .y = theor_isotopes,
+                               .f = ~ SpectrumSimilarity(spec.top = .x,
+                                                         spec.bottom = .y,
+                                                         t = 0.025,
+                                                         b = 5,
+                                                         print.graphic = FALSE)))
+```
+
+The fragment percentage, with isotope distribution filtering.
+
+```{r}
+peptide_res <- peptide_res %>% 
+  mutate(found = ifelse(value >= cor_limit &
+                          similarity >= 0.75,
+                        TRUE,
+                        FALSE),
+         found = ifelse(is.na(found),
+                        FALSE,
+                        found))
+
+peptide_res %>% 
+  filter(fragment != "precursor") %>% 
+  group_by(series, charge) %>% 
+  summarise(frag_found = mean(found),
+            .groups = "drop")
+```
+
+```{r}
+# if 3rd or 4th isotope is 100% remove them
+cleanup_isotopes <- function(x) {
+  if(x$i_perc[3] == 100 | x$i_perc[4] == 100) {
+    res <- x[-c(3, 4), ]
+  } else {
+    res <- x
+  }
+  return(res)
+}
+
+peptide_res <- peptide_res %>%
+  mutate(meas_isotopes = map(.x = meas_isotopes,
+                             .f = ~ cleanup_isotopes(.x)))
+
+peptide_res <- peptide_res %>% 
+  mutate(similarity = map2_dbl(.x = meas_isotopes,
+                               .y = theor_isotopes,
+                               .f = ~ SpectrumSimilarity(spec.top = .x,
+                                                         spec.bottom = .y,
+                                                         t = 0.025,
+                                                         b = 5,
+                                                         print.graphic = FALSE)))
+
+peptide_res <- peptide_res %>% 
+  mutate(found = ifelse(value >= cor_limit &
+                          similarity >= 0.75,
+                        TRUE,
+                        FALSE),
+         found = ifelse(is.na(found),
+                        FALSE,
+                        found))
+
+peptide_res %>% 
+  filter(fragment != "precursor") %>% 
+  group_by(series, charge) %>% 
+  summarise(frag_found = mean(found),
+            .groups = "drop")
+```
+
+
+# All peptides
+
+Do all peptides at once.
+
+```{r eval=FALSE}
+# start the cluster
+cl <- makeCluster(detectCores()[1] - 2) #not to overload your computer
+registerDoParallel(cl)
+
+rt_windows <- c(5, 10, 15, 20, 25, 30, 35, 40)
+rt_all_results <- NULL
+
+for (rt_window in rt_windows) {
+  
+  all_results <- foreach (select_pep_id = 1:38, 
+                          .combine = rbind, 
+                          .packages = c("tidyverse", "xcms", "OrgMassSpecR")) %dopar% {
+                            # get the info of one peptide
+                            peptide <- db_data %>% 
+                              filter(pep_id == select_pep_id) %>% 
+                              mutate(mz_char = sprintf("%.4f", mz))
+                            
+                            # create mz and rt ranges
+                            mzs <- matrix(c(peptide$mz - mz_window, peptide$mz + mz_window), ncol = 2)
+                            rts <- unique(peptide$RT) * 60 + c(-rt_window, rt_window)
+                            
+                            # get all EIC's
+                            eics <- chromatogram(object = raw_data,
+                                                 mz = mzs,
+                                                 rt = rts,
+                                                 msLevel = 2L,
+                                                 aggregationFun = "max")
+                            ### correlation part
+                            # put everything in a single data frame
+                            eic_df_wide <- cbind(tibble(rt = rtime(eics[[1]])), mapply(intensity, eics))
+                            # set the column names
+                            colnames(eic_df_wide) <- c("rt", sprintf("%.4f", peptide$mz))
+                            
+                            # calculate the ratio of NA's
+                            num_na <- sapply(eic_df_wide[, -1], function(x) mean(is.na(x)))
+                            num_na_names <- names(which(num_na > 0.8))
+                            
+                            # get the highest value for each precursor signal
+                            high_precursor <- sapply(eic_df_wide[, 2:4], max, na.rm = TRUE)
+                            highest_precursor <- names(which(high_precursor == max(high_precursor, na.rm = TRUE)))
+                            
+                            # remove the columns which contain too many NA's
+                            eic_cor_df <- eic_df_wide[, -1] %>% 
+                              select(-any_of(num_na_names))
+                            # replace NA's by zero
+                            eic_cor_df[is.na(eic_cor_df)] <- 0
+                            
+                            # calculate the correlation between the EIC's
+                            eic_cor_result <- cor(eic_cor_df)[, highest_precursor]
+                            
+                            # transform to dataframe, first 3 rows are the precursor signals
+                            cor_result_df <- as_tibble(eic_cor_result,
+                                                       rownames = "fragment_mz")
+                            
+                            peptide_res <- peptide %>% 
+                              left_join(y = cor_result_df,
+                                        by = c("mz_char" = "fragment_mz")) %>% 
+                              mutate(found = ifelse(value >= cor_limit,
+                                                    TRUE,
+                                                    FALSE),
+                                     found = ifelse(is.na(found),
+                                                    FALSE,
+                                                    found),
+                                     rt_window = 2 * rt_window,
+                                     # get the measure isotope ratio
+                                     meas_isotopes = pmap(.l = list(mz, M1, M2, M3, RT),
+                                                          .f = ~ get_measured_isotopes(M0 = ..1,
+                                                                                       M1 = ..2,
+                                                                                       M2 = ..3,
+                                                                                       M3 = ..4,
+                                                                                       RT = ..5)),
+                                     # if 3rd or 4th isotope is 100%, remove them, this due to overlapping ion
+                                     meas_isotopes = map(.x = meas_isotopes,
+                                                         .f = ~ cleanup_isotopes(.x)))
+                            
+                            #  calculate the similarity
+                            peptide_res <- peptide_res %>% 
+                              mutate(similarity = map2_dbl(.x = meas_isotopes,
+                                                           .y = theor_isotopes,
+                                                           .f = ~ SpectrumSimilarity(spec.top = .x,
+                                                                                     spec.bottom = .y,
+                                                                                     t = 0.025,
+                                                                                     b = 5,
+                                                                                     print.graphic = FALSE)))
+                            
+                            peptide_res
+                          }
+  
+  rt_all_results <- rbind(rt_all_results, all_results)
+}
+# stop the cluster
+stopCluster(cl)
+
+save(rt_all_results,
+     file = here(data_dir, "all_results.Rdata"))
+```
+
+
+```{r eval=FALSE}
+load(here(data_dir, "all_results.Rdata"))
+```
+
+## No filtering isotope distribution
+
+The median of the fragment percentage for retention time window 30s (+/- 15s). No filtering based on isotope distribution.
+
+```{r}
+# calculate the fragment found percentage
+frag_found <- rt_all_results %>% 
+  filter(fragment != "precursor") %>% 
+  group_by(rt_window, pep_id, series, charge) %>% 
+  summarise(frag_found = mean(found, na.rm = TRUE),
+            pep_id = pep_id[1],
+            rt_window = rt_window[1],
+            .groups = "drop") 
+
+frag_found %>%
+  filter(rt_window == 30) %>% 
+  group_by(series, charge) %>% 
+  summarise(median = median(frag_found),
+            .groups = "drop")
+```
+
+Show the fragment percentages for all retention time windows.
+
+```{r fig.width=8, fig.height=6}
+frag_found %>% 
+  mutate(frag_found = frag_found * 100,
+         series = paste0(series, charge, "+"),
+         rt_window = factor(rt_window)) %>% 
+  ggplot(aes(x = series,
+             y = frag_found,
+             fill = rt_window)) +
+  geom_boxplot(aes()) +
+  # geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_point(size = 1,
+  #            position=position_jitterdodge(jitter.width = 0.1)) +
+  labs(x = "Fragment ion series",
+       y = "Fragment percentage [%]",
+       fill = "RT window") +
+  # coord_flip() +
+  theme_minimal()
+```
+
+```{r fig.width=8, fig.height=6}
+frag_found %>% 
+  mutate(frag_found = frag_found * 100,
+         series = paste0(series, charge, "+"),
+         rt_window = factor(rt_window)) %>% 
+  ggplot(aes(x = series,
+             y = frag_found,
+             fill = rt_window)) +
+  geom_boxplot(aes()) +
+  # geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_point(size = 1,
+  #            position=position_jitterdodge(jitter.width = 0.1)) +
+  labs(x = "Fragment ion series",
+       y = "Fragment percentage [%]",
+       fill = "RT window",
+       title = "No Filtering Isotope Distribution") +
+  # coord_flip() +
+  theme_minimal()
+```
+
+## Filtering isotope distribution
+
+If the isotope distribution similarity is not high enough (< 0.75) the fragment is set to not being found. The median of the fragment percentage for retention time window 30s (+/- 15s). With filtering based on isotope distribution similarity.
+
+```{r}
+# calculate the fragment found percentage
+frag_found_iso <- rt_all_results %>% 
+  filter(fragment != "precursor") %>%
+  mutate(similarity = ifelse(is.nan(similarity),
+                             0,
+                             similarity),
+         found = ifelse(value >= cor_limit &
+                          similarity >= 0.75,
+                        TRUE,
+                        FALSE)) %>% 
+  group_by(rt_window, pep_id, series, charge) %>% 
+  # calculate fragment percentage found
+  summarise(frag_found = mean(found, na.rm = TRUE),
+            pep_id = pep_id[1],
+            rt_window = rt_window[1],
+            .groups = "drop") 
+
+frag_found_iso %>%
+  filter(rt_window == 30) %>% 
+  group_by(series, charge) %>% 
+  summarise(median = median(frag_found),
+            .groups = "drop")
+```
+
+Show the fragment percentages for all retention time windows.
+
+```{r fig.width=8, fig.height=6}
+frag_found_iso %>% 
+  mutate(frag_found = frag_found * 100,
+         series = paste0(series, charge, "+"),
+         rt_window = factor(rt_window)) %>% 
+  ggplot(aes(x = series,
+             y = frag_found,
+             fill = rt_window)) +
+  geom_boxplot(aes()) +
+  # geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_point(size = 1,
+  #            position=position_jitterdodge(jitter.width = 0.1)) +
+  labs(x = "Fragment ion series",
+       y = "Fragment percentage [%]",
+       fill = "RT window") +
+  # coord_flip() +
+  theme_minimal()
+```
+
+```{r fig.width=8, fig.height=6}
+frag_found_iso %>% 
+  mutate(frag_found = frag_found * 100,
+         series = paste0(series, charge, "+"),
+         rt_window = factor(rt_window)) %>% 
+  ggplot(aes(x = series,
+             y = frag_found,
+             fill = rt_window)) +
+  geom_boxplot(aes()) +
+  # geom_violin(draw_quantiles = c(0.25, 0.5, 0.75)) +
+  # geom_point(size = 1,
+  #            position=position_jitterdodge(jitter.width = 0.1)) +
+  labs(x = "Fragment ion series",
+       y = "Fragment percentage [%]",
+       fill = "RT window",
+       title = "Filtering Isotope Distribution") +
+  # coord_flip() +
+  theme_minimal()
+```
+
+# Session info
+
+```{r session_info}
+sessioninfo::session_info()
+```
+
