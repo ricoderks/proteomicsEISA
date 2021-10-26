@@ -1,0 +1,184 @@
+---
+title: "EISA proteomics - Create  database"
+output: html_notebook
+---
+
+```{r libraries, message=FALSE, warning=FALSE, results=FALSE, echo=FALSE}
+library(here)
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(OrgMassSpecR)
+
+source("./PepIsotopeDistribution.R")
+```
+
+```{r geneneral_stuff}
+work_dir <- here()
+data_dir <- here(work_dir, "Data")
+
+db_file <- "BSA_peptides.xlsx"
+```
+
+# Read excel file
+
+* Sheet1 contains a list with the precursors.
+* Sheet3 contains for each peptide the b and y fragments
+
+```{r results=FALSE}
+precursors_info <- read_xlsx(path = here(data_dir, db_file),
+                             sheet = "Sheet1") %>% 
+  # remove some empty columns
+  select(-c(`...9`, `...10`, `...11`))
+
+# clean up
+peptide_info <- precursors_info  %>% 
+  # rename some columns
+  rename(peptide = `peptides (observed)`,
+         mz_prec = `M+H`,
+         mz_2 = `2+`,
+         mz_3 = `3+`) %>% 
+  mutate(
+    # transform the retention time to real numbers instead of characters
+    RT = as.numeric(str_extract(string = RT,
+                                pattern = "[0-9]{1,2}\\.?[0-9]{1,2}")),
+    pep_length = as.numeric(str_extract(string = peptide,
+                                        pattern = "[0-9]*$")) -
+      as.numeric(str_extract(string = peptide,
+                             pattern = "^[0-9]*")) + 1,
+    pep_id = 1:n()
+  ) %>% 
+  relocate(pep_id, .before = peptide)
+```
+
+There are 38 peptides in the Excel sheet.
+
+Define the start position of each peptide.
+
+```{r}
+range_fragments <- tibble(pep_id = 1:38,
+                          start_row = c(1, 14, 25, 39, 55, 69,
+                                        84, 103, 114, 130, 139, 158,
+                                        175, 192, 205, 218, 237, 253,
+                                        270, 285, 299, 321, 338, 354,
+                                        372, 388, 406, 426, 446, 466,
+                                        480, 501, 523, 539, 557, 578,
+                                        601, 618) # this is including the header of each table
+)
+```
+
+Read all the tables from `Sheet3`.
+
+```{r results=FALSE}
+all_info <- peptide_info %>% 
+  left_join(y = range_fragments,
+            by = "pep_id") %>% 
+  mutate(start_range = paste0("A", start_row, ":S", start_row + pep_length),
+         # read all fragment info
+         fragments = map(.x = start_range,
+                         .f = ~ read_xlsx(path = here(data_dir, db_file),
+                                          sheet = "Sheet3",
+                                          range = .x) %>% 
+                           # add numbering of fragments
+                           mutate(b_num = 1:n(),
+                                  y_num = n():1) %>% 
+                           # ony select the columns which I want to use
+                           select(b_num, b, y_num, y) %>% 
+                           # make longer
+                           pivot_longer(cols = c(b, y),
+                                        names_to = "fragment",
+                                        values_to = "mz_fragment") %>% 
+                           # create fragment names
+                           mutate(fragment = if_else(fragment == "b",
+                                              paste0(fragment, b_num),
+                                              paste0(fragment, y_num))) %>% 
+                           # keep only the columns I want
+                           select(fragment, mz_fragment))) %>% 
+  # unfold
+  unnest(fragments) %>% 
+  pivot_longer(cols = c(mz_prec, mz_fragment),
+               names_to = "type",
+               values_to = "mz") %>% 
+  select(pep_id, peptide, sequence, type, Mass, mz, mz_2, mz_3, fragment, RT) %>% 
+  filter(!is.na(mz)) %>% 
+  mutate(Mass = if_else(type == "mz_prec",
+                        Mass,
+                        NA_real_),
+         mz_3 = if_else(type == "mz_prec",
+                        mz_3,
+                        NA_real_),
+         mz_2 = if_else(type == "mz_prec",
+                        mz_2,
+                        mz / 2 + 0.5037),
+         fragment = if_else(type == "mz_prec",
+                            "",
+                            fragment)) %>% 
+  distinct(sequence, mz, .keep_all = TRUE) %>% 
+  # create charge column
+  rename(mz_1 = mz) %>% 
+  pivot_longer(cols = starts_with("mz"),
+               names_to = "charge",
+               values_to = "mz",
+               names_prefix = "mz_",
+               names_transform = list(charge = as.integer)) %>% 
+  mutate(fragment = if_else(type == "mz_prec",
+                            "precursor",
+                            fragment)) %>% 
+  filter(!is.na(mz)) %>% 
+  select(pep_id, peptide, sequence, Mass, RT, fragment, mz, charge)
+```
+
+# Calculate theoretical isotopic distributions. This takes a long time to compute.
+
+```{r}
+all_info <- all_info %>% 
+  mutate(series = if_else(fragment != "precursor",
+                          str_extract(string = fragment,
+                                      pattern = "[by]"),
+                          ""),
+         ms2type = if_else(fragment == "precursor",
+                          "",
+                          paste0("[", fragment, "]", charge, "+")),
+         # get the sequence for the fragments
+         ms2seq = map2_chr(.x = sequence,
+                           .y = ms2type,
+                           .f = ~ ifelse(.y == "",
+                                         "",
+                                         FragmentPeptide(sequence = .x) %>% 
+                                           filter(ms2type == .y) %>% 
+                                           pull(ms2seq))),
+         ms2seq = ifelse(is.na(ms2seq),
+                         sequence,
+                         ms2seq),
+         # calculate the theoretical distriution
+         theor_isotopes = pmap(.l = list(ms2seq, charge, series),
+                               .f = ~ PepIsotopeDistribution(sequence = ..1,
+                                                             charge = ..2,
+                                                             series = ..3) %>%
+                                 select(mz, percent)))
+```
+
+# Export 
+
+Export to new Excel file.
+
+```{r eval=FALSE}
+write.xlsx(x = all_info,
+           file = here(data_dir, "peptide_db.xlsx"),
+           overwrite = TRUE)
+```
+
+This data base cannot be exported to Excel. I will export it to an .Rdata file.
+
+```{r}
+db_data <- all_info
+save(db_data,
+     file = here(data_dir, "peptide_db.Rdata"))
+```
+
+
+
+```{r session_info}
+sessioninfo::session_info()
+```
+
